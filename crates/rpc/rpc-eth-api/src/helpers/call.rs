@@ -16,8 +16,8 @@ use alloy_evm::{
 use alloy_network::TransactionBuilder;
 use alloy_primitives::{Bytes, B256, U256};
 use alloy_rpc_types_eth::{
-    simulate::{SimBlock, SimulatePayload, SimulatedBlock},
-    state::{EvmOverrides, StateOverride},
+    simulate::{SimBlock, SimulatePayload},
+    state::{AccountOverride, EvmOverrides, StateOverride},
     BlockId, Bundle, EthCallResponse, StateContext, TransactionInfo,
 };
 use futures::Future;
@@ -36,7 +36,7 @@ use reth_rpc_convert::{RpcConvert, RpcTxReq};
 use reth_rpc_eth_types::{
     cache::db::{StateCacheDbRefMutWrapper, StateProviderTraitObjWrapper},
     error::{api::FromEvmHalt, ensure_success, FromEthApiError},
-    simulate::{self, EthSimulateError},
+    simulate::{self, EthSimulateError, SimulatePayloadSd, SimulatedBlockSd},
     EthApiError, RevertError, RpcInvalidTransactionError, StateCacheDb,
 };
 use reth_storage_api::{BlockIdReader, ProviderTx};
@@ -51,7 +51,7 @@ use revm_inspectors::{access_list::AccessListInspector, transfer::TransferInspec
 use tracing::trace;
 
 /// Result type for `eth_simulateV1` RPC method.
-pub type SimulatedBlocksResult<N, E> = Result<Vec<SimulatedBlock<RpcBlock<N>>>, E>;
+pub type SimulatedBlocksResult<N, E> = Result<Vec<SimulatedBlockSd<RpcBlock<N>>>, E>;
 
 /// Execution related functions for the [`EthApiServer`](crate::EthApiServer) trait in
 /// the `eth_` namespace.
@@ -72,7 +72,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
     /// See also: <https://github.com/ethereum/go-ethereum/pull/27720>
     fn simulate_v1(
         &self,
-        payload: SimulatePayload<RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>>,
+        payload: SimulatePayloadSd<RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>>,
         block: Option<BlockId>,
     ) -> impl Future<Output = SimulatedBlocksResult<Self::NetworkTypes, Self::Error>> + Send {
         async move {
@@ -82,11 +82,15 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
             let block = block.unwrap_or_default();
 
-            let SimulatePayload {
-                block_state_calls,
-                trace_transfers,
-                validation,
-                return_full_transactions,
+            let SimulatePayloadSd {
+                inner:
+                    SimulatePayload {
+                        block_state_calls,
+                        trace_transfers,
+                        validation,
+                        return_full_transactions,
+                    },
+                state_diff,
             } = payload;
 
             if block_state_calls.is_empty() {
@@ -101,7 +105,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             self.spawn_with_state_at_block(block, move |state| {
                 let mut db =
                     State::builder().with_database(StateProviderDatabase::new(state)).build();
-                let mut blocks: Vec<SimulatedBlock<RpcBlock<Self::NetworkTypes>>> =
+                let mut blocks: Vec<SimulatedBlockSd<RpcBlock<Self::NetworkTypes>>> =
                     Vec::with_capacity(block_state_calls.len());
                 for block in block_state_calls {
                     let mut evm_env = this
@@ -119,6 +123,8 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                         evm_env.cfg_env.disable_base_fee = true;
                         evm_env.block_env.basefee = 0;
                     }
+
+                    let pre_cache = db.cache.clone();
 
                     let SimBlock { block_overrides, state_overrides, calls } = block;
 
@@ -202,7 +208,64 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                         this.tx_resp_builder(),
                     )?;
 
-                    blocks.push(block);
+                    // If we have asked for the state diff, calculate it from the dbs.
+                    let state_diff = if state_diff {
+                        let mut state_diff = StateOverride::default();
+
+                        for (address, new_account) in &db.cache.accounts {
+                            let Some(new_account) = new_account.account.as_ref() else {
+                                continue;
+                            };
+                            let old_account = pre_cache
+                                .accounts
+                                .get(address)
+                                .map(|acc| acc.account.as_ref())
+                                .flatten();
+
+                            let mut account_override: Option<AccountOverride> = None;
+
+                            if new_account.info.balance !=
+                                old_account.map(|acc| acc.info.balance).unwrap_or_default()
+                            {
+                                account_override.get_or_insert_default().balance =
+                                    Some(new_account.info.balance);
+                            }
+                            if new_account.info.nonce !=
+                                old_account.map(|acc| acc.info.nonce).unwrap_or_default()
+                            {
+                                account_override.get_or_insert_default().nonce =
+                                    Some(new_account.info.nonce);
+                            }
+                            for (&slot, &new_value) in &new_account.storage {
+                                if let Some(&old_value) =
+                                    old_account.map(|acc| acc.storage.get(&slot)).flatten()
+                                {
+                                    if old_value == new_value {
+                                        continue;
+                                    }
+                                }
+
+                                let slot = B256::from(slot);
+                                let new_value = B256::from(new_value);
+
+                                account_override
+                                    .get_or_insert_default()
+                                    .state
+                                    .get_or_insert_default()
+                                    .insert(slot, new_value);
+                            }
+
+                            if let Some(account_override) = account_override {
+                                state_diff.insert(*address, account_override);
+                            }
+                        }
+
+                        Some(state_diff)
+                    } else {
+                        None
+                    };
+
+                    blocks.push(SimulatedBlockSd { inner: block, state_diff });
                 }
 
                 Ok(blocks)

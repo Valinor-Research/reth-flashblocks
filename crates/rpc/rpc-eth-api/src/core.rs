@@ -9,7 +9,6 @@ use alloy_eips::{eip2930::AccessListResult, BlockId, BlockNumberOrTag};
 use alloy_json_rpc::RpcObject;
 use alloy_primitives::{Address, Bytes, B256, B64, U256, U64};
 use alloy_rpc_types_eth::{
-    simulate::{SimulatePayload, SimulatedBlock},
     state::{EvmOverrides, StateOverride},
     BlockOverrides, Bundle, EIP1186AccountProofResponse, EthCallResponse, FeeHistory, Index,
     StateContext, SyncStatus, Work,
@@ -17,6 +16,7 @@ use alloy_rpc_types_eth::{
 use alloy_serde::JsonStorageKey;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_rpc_convert::RpcTxReq;
+use reth_rpc_eth_types::simulate::{SimulatePayloadSd, SimulatedBlockSd};
 use reth_rpc_server_types::{result::internal_rpc_err, ToRpcResult};
 use tracing::trace;
 
@@ -214,9 +214,9 @@ pub trait EthApi<TxReq: RpcObject, T: RpcObject, B: RpcObject, R: RpcObject, H: 
     #[method(name = "simulateV1")]
     async fn simulate_v1(
         &self,
-        opts: SimulatePayload<TxReq>,
+        opts: SimulatePayloadSd<TxReq>,
         block_number: Option<BlockId>,
-    ) -> RpcResult<Vec<SimulatedBlock<B>>>;
+    ) -> RpcResult<Vec<SimulatedBlockSd<B>>>;
 
     /// Executes a new message call immediately without creating a transaction on the block chain.
     #[method(name = "call")]
@@ -656,9 +656,9 @@ where
     /// Handler for: `eth_simulateV1`
     async fn simulate_v1(
         &self,
-        payload: SimulatePayload<RpcTxReq<T::NetworkTypes>>,
+        payload: SimulatePayloadSd<RpcTxReq<T::NetworkTypes>>,
         block_number: Option<BlockId>,
-    ) -> RpcResult<Vec<SimulatedBlock<RpcBlock<T::NetworkTypes>>>> {
+    ) -> RpcResult<Vec<SimulatedBlockSd<RpcBlock<T::NetworkTypes>>>> {
         trace!(target: "rpc::eth", ?block_number, "Serving eth_simulateV1");
         let _permit = self.tracing_task_guard().clone().acquire_owned().await;
         Ok(EthCall::simulate_v1(self, payload, block_number).await?)

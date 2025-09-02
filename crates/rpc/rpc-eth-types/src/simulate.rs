@@ -11,9 +11,11 @@ use alloy_consensus::{BlockHeader, Transaction as _};
 use alloy_eips::eip2718::WithEncoded;
 use alloy_network::TransactionBuilder;
 use alloy_rpc_types_eth::{
-    simulate::{SimCallResult, SimulateError, SimulatedBlock},
+    simulate::{SimCallResult, SimulateError, SimulatePayload, SimulatedBlock},
+    state::StateOverride,
     BlockTransactionsKind,
 };
+use derive_more::Deref;
 use jsonrpsee_types::ErrorObject;
 use reth_evm::{
     execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutor},
@@ -30,6 +32,7 @@ use revm::{
     primitives::{Address, Bytes, TxKind},
     Database,
 };
+use serde::{Deserialize, Serialize};
 
 /// Errors which may occur during `eth_simulateV1` execution.
 #[derive(Debug, thiserror::Error)]
@@ -259,4 +262,28 @@ where
         |header, size| tx_resp_builder.convert_header(header, size),
     )?;
     Ok(SimulatedBlock { inner: block, calls })
+}
+
+/// A wrapper around [`SimulatePayload`] that adds a `state_diff` field.
+#[derive(Debug, Clone, Serialize, Deserialize, Deref)]
+#[serde(rename_all = "camelCase")]
+pub struct SimulatePayloadSd<T> {
+    /// The real payload.
+    #[deref]
+    pub inner: SimulatePayload<T>,
+    /// An extra parameter that determines if the state diff should be included in the response.
+    #[serde(default)]
+    pub state_diff: bool,
+}
+
+/// A wrapper around [`SimulatedBlock`] that adds a `state_diff` field.
+#[derive(Debug, Clone, Serialize, Deserialize, Deref)]
+#[serde(rename_all = "camelCase")]
+pub struct SimulatedBlockSd<T> {
+    /// The real block.
+    #[deref]
+    pub inner: SimulatedBlock<T>,
+    /// The state diff if requested by the payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_diff: Option<StateOverride>,
 }
