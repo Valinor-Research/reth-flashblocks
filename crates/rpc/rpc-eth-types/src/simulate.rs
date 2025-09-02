@@ -270,6 +270,7 @@ where
 pub struct SimulatePayloadSd<T> {
     /// The real payload.
     #[deref]
+    #[serde(flatten)]
     pub inner: SimulatePayload<T>,
     /// An extra parameter that determines if the state diff should be included in the response.
     #[serde(default)]
@@ -282,6 +283,7 @@ pub struct SimulatePayloadSd<T> {
 pub struct SimulatedBlockSd<T> {
     /// The real block.
     #[deref]
+    #[serde(flatten)]
     pub inner: SimulatedBlock<T>,
     /// The state diff if requested by the payload.
     #[serde(skip_serializing_if = "Option::is_none")]
