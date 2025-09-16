@@ -14,14 +14,14 @@ use alloy_network::TransactionBuilder;
 use alloy_primitives::{Bytes, B256, U256};
 use alloy_rpc_types_eth::{
     simulate::{SimBlock, SimulatePayload, SimulatedBlock},
-    state::{EvmOverrides, StateOverride},
-    BlockId, Bundle, EthCallResponse, StateContext, TransactionInfo,
+    state::{AccountOverride, EvmOverrides, StateOverride},
+    BlockId, BlockTransactionsKind, Bundle, EthCallResponse, StateContext, TransactionInfo,
 };
 use futures::Future;
 use reth_errors::{ProviderError, RethError};
 use reth_evm::{
-    ConfigureEvm, Evm, EvmEnv, EvmEnvFor, HaltReasonFor, InspectorFor, SpecFor, TransactionEnv,
-    TxEnvFor,
+    execute::BlockBuilder, ConfigureEvm, Evm, EvmEnv, EvmEnvFor, HaltReasonFor, InspectorFor,
+    SpecFor, TransactionEnv, TxEnvFor,
 };
 use reth_node_api::BlockBody;
 use reth_primitives_traits::{Recovered, SignedTransaction};
@@ -34,15 +34,16 @@ use reth_rpc_eth_types::{
     cache::db::{StateCacheDbRefMutWrapper, StateProviderTraitObjWrapper},
     error::{api::FromEvmHalt, ensure_success, FromEthApiError},
     simulate::{self, EthSimulateError},
+    utils::recover_raw_transaction,
     EthApiError, RevertError, StateCacheDb,
 };
-use reth_storage_api::{BlockIdReader, ProviderTx};
+use reth_storage_api::{noop::NoopProvider, BlockIdReader, ProviderTx};
 use revm::{
     context_interface::{
         result::{ExecutionResult, ResultAndState},
         Transaction,
     },
-    Database, DatabaseCommit,
+    Database, DatabaseCommit, DatabaseRef,
 };
 use revm_inspectors::{access_list::AccessListInspector, transfer::TransferInspector};
 use tracing::{trace, warn};
@@ -203,6 +204,127 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                 }
 
                 Ok(blocks)
+            })
+            .await
+        }
+    }
+
+    fn simulate_flashblock_transactions(
+        &self,
+        raw_transactions: Vec<Bytes>,
+        block_number: u64,
+        overrides: EvmOverrides,
+    ) -> impl Future<
+        Output = Result<(SimulatedBlock<RpcBlock<Self::NetworkTypes>>, StateOverride), Self::Error>,
+    > + Send {
+        async move {
+            let block: BlockId = block_number.into();
+            let base_block =
+                self.recovered_block(block).await?.ok_or(EthApiError::HeaderNotFound(block))?;
+
+            let this = self.clone();
+            self.spawn_with_state_at_block(block, move |state| {
+                let mut pre_db = CacheDB::new(StateProviderDatabase::new(state));
+
+                // The flashblocks are simulated as the next block to the given block number.
+                // We use the given block number as the "parent" in this context.
+                let parent = base_block.sealed_header().clone();
+                let mut evm_env = this
+                    .evm_config()
+                    .next_evm_env(&parent, &this.next_env_attributes(&parent)?)
+                    .map_err(RethError::other)
+                    .map_err(Self::Error::from_eth_err)?;
+
+                // Apply the block overrides.
+                if let Some(block_overrides) = overrides.block {
+                    apply_block_overrides(*block_overrides, &mut pre_db, &mut evm_env.block_env);
+                }
+                // Apply the state overrides.
+                if let Some(state_overrides) = overrides.state {
+                    apply_state_overrides(state_overrides, &mut pre_db)
+                        .map_err(Self::Error::from_eth_err)?;
+                }
+
+                // Wrap the db in the state object that the block builder wants.
+                let mut post_db = State::builder().with_database(CacheDB::new(&pre_db)).build();
+
+                // Create the builder.
+                let evm = this.evm_config().evm_with_env(&mut post_db, evm_env);
+                let ctx = this
+                    .evm_config()
+                    .context_for_next_block(&parent, this.next_env_attributes(&parent)?);
+                let mut builder = this.evm_config().create_block_builder(evm, &parent, ctx);
+
+                // Simulate the transactions.
+                builder.apply_pre_execution_changes().map_err(EthApiError::from)?;
+                let mut results = Vec::with_capacity(raw_transactions.len());
+                for raw_transaction in raw_transactions {
+                    let recovered = recover_raw_transaction(&raw_transaction)?;
+                    builder
+                        .execute_transaction_with_result_closure(recovered, |result| {
+                            results.push(result.clone())
+                        })
+                        .map_err(EthApiError::from)?;
+                }
+                // Pass noop provider to skip state root calculations.
+                let result = builder.finish(NoopProvider::default()).map_err(EthApiError::from)?;
+
+                let block = simulate::build_simulated_block(
+                    result.block,
+                    results,
+                    BlockTransactionsKind::Hashes,
+                    this.tx_resp_builder(),
+                )?;
+
+                // Calculate the state diff.
+                let mut state_diff = StateOverride::default();
+                for (&address, new_account) in &post_db.cache.accounts {
+                    let Some(new_account) = new_account.account.as_ref() else {
+                        continue;
+                    };
+                    let old_account_info = pre_db.basic_ref(address)?.unwrap_or_default();
+
+                    let mut account_override: Option<AccountOverride> = None;
+
+                    if new_account.info.balance != old_account_info.balance {
+                        account_override.get_or_insert_default().balance =
+                            Some(new_account.info.balance);
+                    }
+                    if new_account.info.nonce != old_account_info.nonce {
+                        account_override.get_or_insert_default().nonce =
+                            Some(new_account.info.nonce);
+                    }
+                    // TODO: Check if this is actually correct. Can we rely on the hash?
+                    if new_account.info.code_hash != old_account_info.code_hash {
+                        // Fetch the code from the DB rather than expecting it to be in the account.
+                        // Not entirely sure what the rules are here.
+                        let new_code = post_db.code_by_hash_ref(new_account.info.code_hash)?;
+                        account_override.get_or_insert_default().code =
+                            Some(new_code.original_bytes());
+                    }
+
+                    for (&slot, &new_value) in &new_account.storage {
+                        let old_value = pre_db.storage_ref(address, slot)?;
+                        if new_value == old_value {
+                            continue;
+                        }
+
+                        let slot = B256::from(slot);
+                        let new_value = B256::from(new_value);
+
+                        account_override
+                            .get_or_insert_default()
+                            .state
+                            .get_or_insert_default()
+                            .insert(slot, new_value);
+                    }
+
+                    if let Some(account_override) = account_override {
+                        state_diff.insert(address, account_override);
+                    }
+                }
+
+                Ok((block, state_diff))
             })
             .await
         }

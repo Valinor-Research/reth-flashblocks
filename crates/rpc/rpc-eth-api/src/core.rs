@@ -218,6 +218,16 @@ pub trait EthApi<TxReq: RpcObject, T: RpcObject, B: RpcObject, R: RpcObject, H: 
         block_number: Option<BlockId>,
     ) -> RpcResult<Vec<SimulatedBlock<B>>>;
 
+    /// Simulates a flashblock. Specifically for use withing valinor-rs.
+    #[method(name = "simulateFlashblockTransactions")]
+    async fn simulate_flashblock_transactions(
+        &self,
+        raw_transactions: Vec<Bytes>,
+        block_number: u64,
+        state_overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
+    ) -> RpcResult<(SimulatedBlock<B>, StateOverride)>;
+
     /// Executes a new message call immediately without creating a transaction on the block chain.
     #[method(name = "call")]
     async fn call(
@@ -662,6 +672,25 @@ where
         trace!(target: "rpc::eth", ?block_number, "Serving eth_simulateV1");
         let _permit = self.tracing_task_guard().clone().acquire_owned().await;
         Ok(EthCall::simulate_v1(self, payload, block_number).await?)
+    }
+
+    /// Handler for: `eth_simulateFlashblockTransactions`
+    async fn simulate_flashblock_transactions(
+        &self,
+        raw_transactions: Vec<Bytes>,
+        block_number: u64,
+        state_overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
+    ) -> RpcResult<(SimulatedBlock<RpcBlock<T::NetworkTypes>>, StateOverride)> {
+        trace!(target: "rpc::eth", ?block_number, "Serving eth_simulateFlashblockTransactions");
+        let _permit = self.tracing_task_guard().clone().acquire_owned().await;
+        Ok(EthCall::simulate_flashblock_transactions(
+            self,
+            raw_transactions,
+            block_number,
+            EvmOverrides::new(state_overrides, block_overrides),
+        )
+        .await?)
     }
 
     /// Handler for: `eth_call`
