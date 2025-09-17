@@ -314,7 +314,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
 
                         account_override
                             .get_or_insert_default()
-                            .state
+                            .state_diff
                             .get_or_insert_default()
                             .insert(slot, new_value);
                     }
