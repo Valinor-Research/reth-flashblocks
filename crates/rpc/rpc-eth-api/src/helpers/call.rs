@@ -5,7 +5,11 @@ use core::fmt;
 
 use super::{LoadBlock, LoadPendingBlock, LoadState, LoadTransaction, SpawnBlocking, Trace};
 use crate::{
-    helpers::estimate::EstimateCall, FromEvmError, FullEthApiTypes, RpcBlock, RpcNodeCore,
+    flashblocks_state_override::{
+        apply_flashblocks_state_overrides, FlashblocksAccountOverride, FlashblocksStateOverride,
+    },
+    helpers::estimate::EstimateCall,
+    FromEvmError, FullEthApiTypes, RpcBlock, RpcNodeCore,
 };
 use alloy_consensus::{transaction::TxHashRef, BlockHeader};
 use alloy_eips::eip2930::AccessListResult;
@@ -14,8 +18,9 @@ use alloy_network::TransactionBuilder;
 use alloy_primitives::{Bytes, B256, U256};
 use alloy_rpc_types_eth::{
     simulate::{SimBlock, SimulatePayload, SimulatedBlock},
-    state::{AccountOverride, EvmOverrides, StateOverride},
-    BlockId, BlockTransactionsKind, Bundle, EthCallResponse, StateContext, TransactionInfo,
+    state::{EvmOverrides, StateOverride},
+    BlockId, BlockOverrides, BlockTransactionsKind, Bundle, EthCallResponse, StateContext,
+    TransactionInfo,
 };
 use futures::Future;
 use reth_errors::{ProviderError, RethError};
@@ -73,7 +78,8 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         &self,
         payload: SimulatePayload<RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>>,
         block: Option<BlockId>,
-        flashblock_overrides: EvmOverrides,
+        flashblocks_state_overrides: Option<FlashblocksStateOverride>,
+        flashblocks_block_overrides: Option<Box<BlockOverrides>>,
     ) -> impl Future<Output = SimulatedBlocksResult<Self::NetworkTypes, Self::Error>> + Send {
         async move {
             if payload.block_state_calls.len() > self.max_simulate_blocks() as usize {
@@ -103,8 +109,8 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                     State::builder().with_database(StateProviderDatabase::new(state)).build();
 
                 // Apply the flashblocks state overrides.
-                if let Some(flashblocks_state_overrides) = flashblock_overrides.state {
-                    apply_state_overrides(flashblocks_state_overrides, &mut db)
+                if let Some(flashblocks_state_overrides) = flashblocks_state_overrides {
+                    apply_flashblocks_state_overrides(flashblocks_state_overrides, &mut db)
                         .map_err(Self::Error::from_eth_err)?;
                 }
 
@@ -131,7 +137,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                     let SimBlock { block_overrides, state_overrides, calls } = block;
 
                     // Apply the flashblocks block overrides.
-                    if let Some(flashblocks_block_overrides) = &flashblock_overrides.block {
+                    if let Some(flashblocks_block_overrides) = &flashblocks_block_overrides {
                         apply_block_overrides(
                             flashblocks_block_overrides.as_ref().clone(),
                             &mut db,
@@ -236,9 +242,13 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         &self,
         raw_transactions: Vec<Bytes>,
         block_number: u64,
-        flashblock_overrides: EvmOverrides,
+        flashblock_state_overrides: Option<FlashblocksStateOverride>,
+        flashblock_block_overrides: Option<Box<BlockOverrides>>,
     ) -> impl Future<
-        Output = Result<(SimulatedBlock<RpcBlock<Self::NetworkTypes>>, StateOverride), Self::Error>,
+        Output = Result<
+            (SimulatedBlock<RpcBlock<Self::NetworkTypes>>, FlashblocksStateOverride),
+            Self::Error,
+        >,
     > + Send {
         async move {
             let block: BlockId = block_number.into();
@@ -259,16 +269,16 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                     .map_err(Self::Error::from_eth_err)?;
 
                 // Apply the block overrides.
-                if let Some(block_overrides) = flashblock_overrides.block {
+                if let Some(flashblock_block_overrides) = flashblock_block_overrides {
                     apply_block_overrides(
-                        *block_overrides,
+                        *flashblock_block_overrides,
                         &mut pre_db,
                         evm_env.block_env.inner_mut(),
                     );
                 }
                 // Apply the state overrides.
-                if let Some(state_overrides) = flashblock_overrides.state {
-                    apply_state_overrides(state_overrides, &mut pre_db)
+                if let Some(flashblock_state_overrides) = flashblock_state_overrides {
+                    apply_flashblocks_state_overrides(flashblock_state_overrides, &mut pre_db)
                         .map_err(Self::Error::from_eth_err)?;
                 }
 
@@ -306,14 +316,14 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                 )?;
 
                 // Calculate the state diff.
-                let mut state_diff = StateOverride::default();
+                let mut state_diff = FlashblocksStateOverride::default();
                 for (&address, new_account) in &post_db.cache.accounts {
                     let Some(new_account) = new_account.account.as_ref() else {
                         continue;
                     };
                     let old_account_info = pre_db.basic_ref(address)?.unwrap_or_default();
 
-                    let mut account_override: Option<AccountOverride> = None;
+                    let mut account_override: Option<FlashblocksAccountOverride> = None;
 
                     if new_account.info.balance != old_account_info.balance {
                         account_override.get_or_insert_default().balance =
@@ -365,7 +375,8 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         block_number: Option<BlockId>,
         overrides: EvmOverrides,
-        flashblock_overrides: EvmOverrides,
+        flashblock_state_overrides: Option<FlashblocksStateOverride>,
+        flashblock_block_overrides: Option<Box<BlockOverrides>>,
     ) -> impl Future<Output = Result<Bytes, Self::Error>> + Send {
         async move {
             let res = self
@@ -373,7 +384,8 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                     request,
                     block_number.unwrap_or_default(),
                     overrides,
-                    flashblock_overrides,
+                    flashblock_state_overrides,
+                    flashblock_block_overrides,
                 )
                 .await?;
 
@@ -722,7 +734,8 @@ pub trait Call:
         request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         at: BlockId,
         overrides: EvmOverrides,
-        flashblock_overrides: EvmOverrides,
+        flashblock_state_overrides: Option<FlashblocksStateOverride>,
+        flashblock_block_overrides: Option<Box<BlockOverrides>>,
     ) -> impl Future<Output = Result<ResultAndState<HaltReasonFor<Self::Evm>>, Self::Error>> + Send
     where
         Self: LoadPendingBlock,
@@ -732,7 +745,8 @@ pub trait Call:
             request,
             at,
             overrides,
-            flashblock_overrides,
+            flashblock_state_overrides,
+            flashblock_block_overrides,
             move |db, evm_env, tx_env| this.transact(db, evm_env, tx_env),
         )
     }
@@ -773,7 +787,8 @@ pub trait Call:
         request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         at: BlockId,
         overrides: EvmOverrides,
-        flashblocks_overrides: EvmOverrides,
+        flashblocks_state_overrides: Option<FlashblocksStateOverride>,
+        flashblocks_block_overrides: Option<Box<BlockOverrides>>,
         f: F,
     ) -> impl Future<Output = Result<R, Self::Error>> + Send
     where
@@ -797,7 +812,7 @@ pub trait Call:
                     .build();
 
                 // Apply the flashblocks block overrides.
-                if let Some(flashblocks_block_overrides) = flashblocks_overrides.block {
+                if let Some(flashblocks_block_overrides) = flashblocks_block_overrides {
                     apply_block_overrides(
                         *flashblocks_block_overrides,
                         &mut db,
@@ -805,8 +820,8 @@ pub trait Call:
                     );
                 }
                 // Apply the flashblocks state overrides.
-                if let Some(flashblocks_state_overrides) = flashblocks_overrides.state {
-                    apply_state_overrides(flashblocks_state_overrides, &mut db)
+                if let Some(flashblocks_state_overrides) = flashblocks_state_overrides {
+                    apply_flashblocks_state_overrides(flashblocks_state_overrides, &mut db)
                         .map_err(Self::Error::from_eth_err)?;
                 }
 
@@ -839,7 +854,7 @@ pub trait Call:
             + 'static,
         R: Send + 'static,
     {
-        self.spawn_with_call_at_flashblock(request, at, overrides, EvmOverrides::default(), f)
+        self.spawn_with_call_at_flashblock(request, at, overrides, None, None, f)
     }
 
     /// Retrieves the transaction if it exists and executes it.
