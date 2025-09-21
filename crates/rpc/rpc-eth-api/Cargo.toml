@@ -47,6 +47,7 @@ alloy-consensus.workspace = true
 # rpc
 jsonrpsee = { workspace = true, features = ["server", "macros"] }
 jsonrpsee-types.workspace = true
+bson = { version = "3.0.0", features = ["serde"] }
 
 # async
 async-trait.workspace = true

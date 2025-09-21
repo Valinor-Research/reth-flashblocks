@@ -73,6 +73,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         &self,
         payload: SimulatePayload<RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>>,
         block: Option<BlockId>,
+        flashblock_overrides: EvmOverrides,
     ) -> impl Future<Output = SimulatedBlocksResult<Self::NetworkTypes, Self::Error>> + Send {
         async move {
             if payload.block_state_calls.len() > self.max_simulate_blocks() as usize {
@@ -100,6 +101,13 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             self.spawn_with_state_at_block(block, move |state| {
                 let mut db =
                     State::builder().with_database(StateProviderDatabase::new(state)).build();
+
+                // Apply the flashblocks state overrides.
+                if let Some(flashblocks_state_overrides) = flashblock_overrides.state {
+                    apply_state_overrides(flashblocks_state_overrides, &mut db)
+                        .map_err(Self::Error::from_eth_err)?;
+                }
+
                 let mut blocks: Vec<SimulatedBlock<RpcBlock<Self::NetworkTypes>>> =
                     Vec::with_capacity(block_state_calls.len());
                 for block in block_state_calls {
@@ -121,6 +129,15 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                     }
 
                     let SimBlock { block_overrides, state_overrides, calls } = block;
+
+                    // Apply the flashblocks block overrides.
+                    if let Some(flashblocks_block_overrides) = &flashblock_overrides.block {
+                        apply_block_overrides(
+                            flashblocks_block_overrides.as_ref().clone(),
+                            &mut db,
+                            evm_env.block_env.inner_mut(),
+                        );
+                    }
 
                     if let Some(block_overrides) = block_overrides {
                         // ensure we don't allow uncapped gas limit per block
@@ -214,11 +231,12 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         }
     }
 
+    /// Simulates the transactions for a flashblock and returns the state diff.
     fn simulate_flashblock_transactions(
         &self,
         raw_transactions: Vec<Bytes>,
         block_number: u64,
-        overrides: EvmOverrides,
+        flashblock_overrides: EvmOverrides,
     ) -> impl Future<
         Output = Result<(SimulatedBlock<RpcBlock<Self::NetworkTypes>>, StateOverride), Self::Error>,
     > + Send {
@@ -241,7 +259,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                     .map_err(Self::Error::from_eth_err)?;
 
                 // Apply the block overrides.
-                if let Some(block_overrides) = overrides.block {
+                if let Some(block_overrides) = flashblock_overrides.block {
                     apply_block_overrides(
                         *block_overrides,
                         &mut pre_db,
@@ -249,7 +267,7 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                     );
                 }
                 // Apply the state overrides.
-                if let Some(state_overrides) = overrides.state {
+                if let Some(state_overrides) = flashblock_overrides.state {
                     apply_state_overrides(state_overrides, &mut pre_db)
                         .map_err(Self::Error::from_eth_err)?;
                 }
@@ -347,10 +365,17 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
         request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         block_number: Option<BlockId>,
         overrides: EvmOverrides,
+        flashblock_overrides: EvmOverrides,
     ) -> impl Future<Output = Result<Bytes, Self::Error>> + Send {
         async move {
-            let res =
-                self.transact_call_at(request, block_number.unwrap_or_default(), overrides).await?;
+            let res = self
+                .transact_call_at(
+                    request,
+                    block_number.unwrap_or_default(),
+                    overrides,
+                    flashblock_overrides,
+                )
+                .await?;
 
             ensure_success(res.result)
         }
@@ -697,14 +722,19 @@ pub trait Call:
         request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
         at: BlockId,
         overrides: EvmOverrides,
+        flashblock_overrides: EvmOverrides,
     ) -> impl Future<Output = Result<ResultAndState<HaltReasonFor<Self::Evm>>, Self::Error>> + Send
     where
         Self: LoadPendingBlock,
     {
         let this = self.clone();
-        self.spawn_with_call_at(request, at, overrides, move |db, evm_env, tx_env| {
-            this.transact(db, evm_env, tx_env)
-        })
+        self.spawn_with_call_at_flashblock(
+            request,
+            at,
+            overrides,
+            flashblock_overrides,
+            move |db, evm_env, tx_env| this.transact(db, evm_env, tx_env),
+        )
     }
 
     /// Executes the closure with the state that corresponds to the given [`BlockId`] on a new task
@@ -738,6 +768,59 @@ pub trait Call:
     /// usually allowed to consume a lot of gas, this also allows a lot of memory operations so
     /// we assume this is not primarily CPU bound and instead spawn the call on a regular tokio task
     /// instead, where blocking IO is less problematic.
+    fn spawn_with_call_at_flashblock<F, R>(
+        &self,
+        request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
+        at: BlockId,
+        overrides: EvmOverrides,
+        flashblocks_overrides: EvmOverrides,
+        f: F,
+    ) -> impl Future<Output = Result<R, Self::Error>> + Send
+    where
+        Self: LoadPendingBlock,
+        F: FnOnce(
+                StateCacheDbRefMutWrapper<'_, '_>,
+                EvmEnvFor<Self::Evm>,
+                TxEnvFor<Self::Evm>,
+            ) -> Result<R, Self::Error>
+            + Send
+            + 'static,
+        R: Send + 'static,
+    {
+        async move {
+            let (mut evm_env, at) = self.evm_env_at(at).await?;
+            let this = self.clone();
+            self.spawn_blocking_io_fut(move |_| async move {
+                let state = this.state_at_block_id(at).await?;
+                let mut db = State::builder()
+                    .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(&state)))
+                    .build();
+
+                // Apply the flashblocks block overrides.
+                if let Some(flashblocks_block_overrides) = flashblocks_overrides.block {
+                    apply_block_overrides(
+                        *flashblocks_block_overrides,
+                        &mut db,
+                        evm_env.block_env.inner_mut(),
+                    );
+                }
+                // Apply the flashblocks state overrides.
+                if let Some(flashblocks_state_overrides) = flashblocks_overrides.state {
+                    apply_state_overrides(flashblocks_state_overrides, &mut db)
+                        .map_err(Self::Error::from_eth_err)?;
+                }
+
+                let (evm_env, tx_env) =
+                    this.prepare_call_env(evm_env, request, &mut db, overrides)?;
+
+                f(StateCacheDbRefMutWrapper(&mut db), evm_env, tx_env)
+            })
+            .await
+        }
+    }
+
+    /// Forwards to [`Self::spawn_with_call_at_flashblock`] with default flashblock overrides to
+    /// avoid breaking the API across the rest of reth.
     fn spawn_with_call_at<F, R>(
         &self,
         request: RpcTxReq<<Self::RpcConvert as RpcConvert>::Network>,
@@ -756,22 +839,7 @@ pub trait Call:
             + 'static,
         R: Send + 'static,
     {
-        async move {
-            let (evm_env, at) = self.evm_env_at(at).await?;
-            let this = self.clone();
-            self.spawn_blocking_io_fut(move |_| async move {
-                let state = this.state_at_block_id(at).await?;
-                let mut db = State::builder()
-                    .with_database(StateProviderDatabase::new(StateProviderTraitObjWrapper(&state)))
-                    .build();
-
-                let (evm_env, tx_env) =
-                    this.prepare_call_env(evm_env, request, &mut db, overrides)?;
-
-                f(StateCacheDbRefMutWrapper(&mut db), evm_env, tx_env)
-            })
-            .await
-        }
+        self.spawn_with_call_at_flashblock(request, at, overrides, EvmOverrides::default(), f)
     }
 
     /// Retrieves the transaction if it exists and executes it.

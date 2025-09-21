@@ -230,15 +230,26 @@ pub trait EthApi<
         block_number: Option<BlockId>,
     ) -> RpcResult<Vec<SimulatedBlock<B>>>;
 
+    /// Same as `simulateV1` but with additional overrides for flashblocks.
+    #[method(name = "simulateV1AtFlashblock")]
+    async fn simulate_v1_at_flashblock(
+        &self,
+        opts: SimulatePayload<TxReq>,
+        block_number: Option<BlockId>,
+        flashblocks_state_overrides_bson: Option<Bytes>,
+        flashblocks_block_overrides: Option<Box<BlockOverrides>>,
+    ) -> RpcResult<Vec<SimulatedBlock<B>>>;
+
     /// Simulates a flashblock. Specifically for use withing valinor-rs.
+    /// Returns the simulated block and a bson encoded [`StateOverride`] state diff.
     #[method(name = "simulateFlashblockTransactions")]
     async fn simulate_flashblock_transactions(
         &self,
         raw_transactions: Vec<Bytes>,
         block_number: u64,
-        state_overrides: Option<StateOverride>,
-        block_overrides: Option<Box<BlockOverrides>>,
-    ) -> RpcResult<(SimulatedBlock<B>, StateOverride)>;
+        flashblocks_state_overrides_bson: Option<Bytes>,
+        flashblocks_block_overrides: Option<Box<BlockOverrides>>,
+    ) -> RpcResult<(SimulatedBlock<B>, Bytes)>;
 
     /// Executes a new message call immediately without creating a transaction on the block chain.
     #[method(name = "call")]
@@ -248,6 +259,18 @@ pub trait EthApi<
         block_number: Option<BlockId>,
         state_overrides: Option<StateOverride>,
         block_overrides: Option<Box<BlockOverrides>>,
+    ) -> RpcResult<Bytes>;
+
+    /// Same as `call` but with additional overrides for flashblocks.
+    #[method(name = "callAtFlashblock")]
+    async fn call_at_flashblock(
+        &self,
+        request: TxReq,
+        block_number: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
+        flashblocks_state_overrides_bson: Option<Bytes>,
+        flashblocks_block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<Bytes>;
 
     /// Fills the defaults on a given unsigned transaction.
@@ -688,7 +711,30 @@ where
     ) -> RpcResult<Vec<SimulatedBlock<RpcBlock<T::NetworkTypes>>>> {
         trace!(target: "rpc::eth", ?block_number, "Serving eth_simulateV1");
         let _permit = self.tracing_task_guard().clone().acquire_owned().await;
-        Ok(EthCall::simulate_v1(self, payload, block_number).await?)
+        Ok(EthCall::simulate_v1(self, payload, block_number, EvmOverrides::default()).await?)
+    }
+
+    /// Handler for: `eth_simulateV1AtFlashblock`
+    async fn simulate_v1_at_flashblock(
+        &self,
+        payload: SimulatePayload<RpcTxReq<T::NetworkTypes>>,
+        block_number: Option<BlockId>,
+        flashblocks_state_overrides_bson: Option<Bytes>,
+        flashblocks_block_overrides: Option<Box<BlockOverrides>>,
+    ) -> RpcResult<Vec<SimulatedBlock<RpcBlock<T::NetworkTypes>>>> {
+        trace!(target: "rpc::eth", ?block_number, "Serving eth_simulateV1AtFlashblock");
+        let _permit = self.tracing_task_guard().clone().acquire_owned().await;
+        let flashblocks_state_overrides: Option<StateOverride> = flashblocks_state_overrides_bson
+            .map(|so| bson::deserialize_from_slice(&so))
+            .transpose()
+            .map_err(|_| internal_rpc_err("failed to deserialize flashblocks state overrides"))?;
+        Ok(EthCall::simulate_v1(
+            self,
+            payload,
+            block_number,
+            EvmOverrides::new(flashblocks_state_overrides, flashblocks_block_overrides),
+        )
+        .await?)
     }
 
     /// Handler for: `eth_simulateFlashblockTransactions`
@@ -696,18 +742,26 @@ where
         &self,
         raw_transactions: Vec<Bytes>,
         block_number: u64,
-        state_overrides: Option<StateOverride>,
-        block_overrides: Option<Box<BlockOverrides>>,
-    ) -> RpcResult<(SimulatedBlock<RpcBlock<T::NetworkTypes>>, StateOverride)> {
+        flashblocks_state_overrides_bson: Option<Bytes>,
+        flashblocks_block_overrides: Option<Box<BlockOverrides>>,
+    ) -> RpcResult<(SimulatedBlock<RpcBlock<T::NetworkTypes>>, Bytes)> {
         trace!(target: "rpc::eth", ?block_number, "Serving eth_simulateFlashblockTransactions");
         let _permit = self.tracing_task_guard().clone().acquire_owned().await;
-        Ok(EthCall::simulate_flashblock_transactions(
+        let flashblocks_state_overrides: Option<StateOverride> = flashblocks_state_overrides_bson
+            .map(|so| bson::deserialize_from_slice(&so))
+            .transpose()
+            .map_err(|_| internal_rpc_err("failed to deserialize flashblocks state overrides"))?;
+        let (block, state_diff) = EthCall::simulate_flashblock_transactions(
             self,
             raw_transactions,
             block_number,
-            EvmOverrides::new(state_overrides, block_overrides),
+            EvmOverrides::new(flashblocks_state_overrides, flashblocks_block_overrides),
         )
-        .await?)
+        .await?;
+        let state_diff_bson: Bytes = bson::serialize_to_vec(&state_diff)
+            .map_err(|_| internal_rpc_err("failed to serialize flashblocks state diff"))?
+            .into();
+        Ok((block, state_diff_bson))
     }
 
     /// Handler for: `eth_call`
@@ -724,6 +778,33 @@ where
             request,
             block_number,
             EvmOverrides::new(state_overrides, block_overrides),
+            EvmOverrides::default(),
+        )
+        .await?)
+    }
+
+    /// Handler for: `eth_callAtFlashblock`
+    async fn call_at_flashblock(
+        &self,
+        request: RpcTxReq<T::NetworkTypes>,
+        block_number: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
+        flashblocks_state_overrides_bson: Option<Bytes>,
+        flashblocks_block_overrides: Option<Box<BlockOverrides>>,
+    ) -> RpcResult<Bytes> {
+        trace!(target: "rpc::eth", ?block_number, "Serving eth_callAtFlashblock");
+        let _permit = self.tracing_task_guard().clone().acquire_owned().await;
+        let flashblocks_state_overrides: Option<StateOverride> = flashblocks_state_overrides_bson
+            .map(|so| bson::deserialize_from_slice(&so))
+            .transpose()
+            .map_err(|_| internal_rpc_err("failed to deserialize flashblocks state overrides"))?;
+        Ok(EthCall::call(
+            self,
+            request,
+            block_number,
+            EvmOverrides::new(state_overrides, block_overrides),
+            EvmOverrides::new(flashblocks_state_overrides, flashblocks_block_overrides),
         )
         .await?)
     }
